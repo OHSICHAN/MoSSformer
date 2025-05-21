@@ -1,8 +1,8 @@
 # SIGformer: Sign-aware Graph Transformer for Recommendation
 
-This is the PyTorch implementation for our SIGIR 2024 paper. 
-> Sirui Chen, Jiawei Chen, Sheng Zhou, Bohao Wang, Shen Han, Chanfei Su, Yuqing Yuan, Can Wang 2024. SIGformer: Sign-aware Graph Transformer for Recommendation
- [arXiv link](https://arxiv.org/abs/2404.11982)
+<!-- This is the PyTorch implementation for our SIGIR 2024 paper.  -->
+> Sichan OH, Jaekwang KIM, MoSSformer : Motif-Enhanced Spectral Structures for Graph-Based Recommendation
+ <!-- [arXiv link](https://arxiv.org/abs/2404.11982) -->
 
 ## Environment
 - python==3.9.19
