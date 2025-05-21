@@ -45,8 +45,8 @@ This is the PyTorch implementation for our SIGIR 2024 paper.
   python -u code/main.py --data=KuaiRand --offset=1 --alpha=1.0 --beta=1 --sample_hop=2 --num_motifs=3 --n_neighbors=35
   ```
 
-## Citation
-If you find the paper useful in your research, please consider citing:
+<!-- ## Citation -->
+<!-- If you find the paper useful in your research, please consider citing:
 ```
 @inproceedings{chen2024sigformer,
   title={SIGformer: Sign-aware Graph Transformer for Recommendation},
@@ -54,5 +54,5 @@ If you find the paper useful in your research, please consider citing:
   booktitle={Proceedings of the 47th International ACM SIGIR Conference on Research and Development in Information Retrieval},
   pages={1274--1284},
   year={2024}
-}
+} -->
 ```
