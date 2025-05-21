@@ -7,46 +7,65 @@ from torch import nn
 import torch.nn.functional as F
 from torch_geometric.utils import structured_negative_sampling
 
-
 class Attention(nn.Module):
     def __init__(self):
         super(Attention, self).__init__()
         self.lambda0 = nn.Parameter(torch.zeros(1))
-        self.path_emb = nn.Embedding(2**(args.sample_hop+1)-2, 1)
-        nn.init.zeros_(self.path_emb.weight)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+        self.motif_emb = nn.Embedding(args.num_motifs, 1)
+        nn.init.ones_(self.motif_emb.weight)
+
         self.sqrt_dim = 1./torch.sqrt(torch.tensor(args.hidden_dim))
         self.sqrt_eig = 1./torch.sqrt(torch.tensor(args.eigs_dim))
+
         self.my_parameters = [
             {'params': self.lambda0, 'weight_decay': 1e-2},
-            {'params': self.path_emb.parameters()},
+            {'params': self.motif_emb.parameters()},
+            {'params': self.gamma}
+            #{'params': self.path_emb.parameters(
         ]
 
-    def forward(self, q, k, v,  indices, eigs, path_type):
+    def forward(self, q, k, v,  indices, eigs, motif_Adj, motif_ids):
         ni, nx, ny, nz = [], [], [], []
-        for i, pt in zip(indices, path_type):
-            x = torch.mul(q[i[0]], k[i[1]]).sum(dim=-1)*self.sqrt_dim
+        
+        motif_embeds = self.motif_emb(motif_ids)  # [N, d]
+        motif_adj_dense = motif_Adj.to_dense()    # [N, N]        #motif_adj_dense = F.layer_norm(motif_adj_dense, normalized_shape=(motif_adj_dense.shape[-1],))
+
+        for i in indices:
+            x = torch.mul(q[i[0]], k[i[1]]).sum(dim=-1) * self.sqrt_dim
             nx.append(x)
+
+            # 고유 벡터에 대한 Attention 값 계산
             if 'eig' in args.model:
-                if args.eigs_dim == 0:
-                    y = torch.zeros(i.shape[1]).to(parse.device)
-                else:
-                    y = torch.mul(eigs[i[0]], eigs[i[1]]).sum(dim=-1)
+                y = torch.mul(eigs[i[0]], eigs[i[1]]).sum(dim=-1)
                 ny.append(y)
-            if 'path' in args.model:
-                z = self.path_emb(pt).view(-1)
-                nz.append(z)
+
+            # motif bias: similarity between motif embeddings
+            if 'motif' in args.model:
+                emb_i = motif_embeds[i[0]]
+                emb_j = motif_embeds[i[1]]
+                # cosine similarity: [-1, 1]
+                sim = F.cosine_similarity(emb_i, emb_j, dim=0)  
+                # motif_adj[i, j]가 1이면 강조, 0이면 무시
+                motif_conn = motif_adj_dense[i[0], i[1]]
+                combined_motif = motif_conn * self.gamma * sim
+                nz.append(combined_motif)
+
             ni.append(i)
+
         i = torch.concat(ni, dim=-1)
         s = []
         s.append(torch.concat(nx, dim=-1))
+
         if 'eig' in args.model:
-            s[0] = s[0]+torch.exp(self.lambda0)*torch.concat(ny, dim=-1)
-        if 'path' in args.model:
+            s[0] = s[0] + torch.exp(self.lambda0) * torch.concat(ny, dim=-1)
+        if 'motif' in args.model:
             s.append(torch.concat(nz, dim=-1))
+
         s = [utils.sparse_softmax(i, _, q.shape[0]) for _ in s]
         s = torch.stack(s, dim=1).mean(dim=1)
         return torchsparsegradutils.sparse_mm(torch.sparse_coo_tensor(i, s, torch.Size([q.shape[0], k.shape[0]])), v)
-
 
 class Encoder(nn.Module):
     def __init__(self):
@@ -54,15 +73,15 @@ class Encoder(nn.Module):
         self.self_attention = Attention()
         self.my_parameters = self.self_attention.my_parameters
 
-    def forward(self, x, indices, eigs, path_type):
+    def forward(self, x, indices, eigs, motif_Adj, motif_ids):
         y = F.layer_norm(x, normalized_shape=(args.hidden_dim,))
         y = self.self_attention(
             y, y, y,
             indices,
             eigs,
-            path_type)
+            motif_Adj,
+            motif_ids)
         return y
-
 
 class Model(nn.Module):
     def __init__(self, dataset):
@@ -74,36 +93,55 @@ class Model(nn.Module):
         self.embedding_item = nn.Embedding(self.dataset.num_items, self.hidden_dim)
         nn.init.normal_(self.embedding_user.weight, std=0.1)
         nn.init.normal_(self.embedding_item.weight, std=0.1)
+
+        self.sqrt_beta = nn.Parameter(torch.ones(args.eigs_dim))
+
         self.my_parameters = [
             {'params': self.embedding_user.parameters()},
             {'params': self.embedding_item.parameters()},
+            {'params': self.sqrt_beta}
         ]
+
         self.layers = []
         for i in range(args.n_layers):
             layer = Encoder().to(parse.device)
             self.layers.append(layer)
             self.my_parameters.extend(layer.my_parameters)
+        
         self._users, self._items = None, None
+        
         self.optimizer = torch.optim.Adam(
             self.my_parameters,
             lr=args.learning_rate)
 
     def computer(self):
+        L_low = self.dataset.L_eigs
+        L_high = self.dataset.L_eigs_h 
+
+        L_eigs = L_low + (self.sqrt_beta**2) * L_high
+        L_eigs = F.layer_norm(L_eigs, normalized_shape=(L_eigs.shape[-1],))
+
+        # L_eigs = self.dataset.L_eigs
+        
         users_emb = self.embedding_user.weight
         items_emb = self.embedding_item.weight
         all_emb = torch.cat([users_emb, items_emb])
         embs = [all_emb]
+                
         for i in range(self.n_layers):
-            indices, paths = self.dataset.sample()
+            indices, _ = self.dataset.sample()
+            
             all_emb = self.layers[i](all_emb,
                                      indices,
-                                     self.dataset.L_eigs,
-                                     paths)
+                                     L_eigs,
+                                     self.dataset.motif_adj,
+                                     self.dataset.motif_ids
+                                    )
             embs.append(all_emb)
         embs = torch.stack(embs, dim=1)
         light_out = torch.mean(embs, dim=1)
         self._users, self._items = torch.split(light_out, [self.dataset.num_users, self.dataset.num_items])
-
+    
     def evaluate(self, test_pos_unique_users, test_pos_list, test_neg_list):
         self.eval()
         if self._users is None:
@@ -144,9 +182,12 @@ class Model(nn.Module):
         self.train()
         pos_u = self.dataset.train_pos_user
         pos_i = self.dataset.train_pos_item
+        
         indices = torch.randperm(self.dataset.train_neg_user.shape[0])
+        
         neg_u = self.dataset.train_neg_user[indices]
         neg_i = self.dataset.train_neg_item[indices]
+        
         all_j = structured_negative_sampling(
                 torch.concat([torch.stack([pos_u, pos_i]), torch.stack([neg_u, neg_i])], dim=1),
                 num_nodes=self.dataset.num_items)[2]

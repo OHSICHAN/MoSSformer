@@ -5,7 +5,12 @@ import parse
 from parse import args
 import scipy.sparse as sp
 import torch.nn.functional as F
-
+import networkx as nx
+import numpy as np
+import os
+import pickle
+from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors
 
 class MyDataset(Dataset):
     def __init__(self, train_file, valid_file, test_file, device):
@@ -66,7 +71,7 @@ class MyDataset(Dataset):
         print('train: %d pos + %d neg.' % (self.train_pos_user.shape[0], self.train_neg_user.shape[0]))
         print('valid: %d pos + %d neg.' % (self.valid_pos_user.shape[0], self.valid_neg_user.shape[0]))
         print('test: %d pos + %d neg.' % (self.test_pos_user.shape[0], self.test_neg_user.shape[0]))
-        #
+        
         self._train_neg_list = None
         self._train_pos_list = None
         self._valid_neg_list = None
@@ -88,7 +93,12 @@ class MyDataset(Dataset):
         self._L = None
         self._L_pos = None
         self._L_neg = None
+
         self._L_eigs = None
+        self._L_eigs_high = None
+
+        self._motif_adj = None
+        self._motif_ids = None
 
     @ property
     def train_pos_list(self):
@@ -215,11 +225,13 @@ class MyDataset(Dataset):
     @ property
     def L(self):
         if self._L is None:
-            self._L = (self.L_pos+args.alpha*self.L_neg)/(1+args.alpha)
+            self._L = ((self.L_pos + args.alpha * self.L_neg))/(1+args.alpha)
+            #self._L = (self.L_pos + self.L_neg)
         return self._L
 
-    @ property
+    @property
     def L_eigs(self):
+
         if self._L_eigs is None:
             if args.eigs_dim == 0:
                 self._L_eigs = torch.tensor([]).to(parse.device)
@@ -227,12 +239,129 @@ class MyDataset(Dataset):
                 _, self._L_eigs = sp.linalg.eigs(
                     sp.csr_matrix(
                         (self.L._values().cpu(), self.L._indices().cpu()),
-                        (self.num_nodes, self.num_nodes)),
-                    k=args.eigs_dim,
-                    which='SR')
+                        (self.num_nodes, self.num_nodes)
+                    
+                    ),
+                    k = args.eigs_dim,
+                    which='SR'
+                )
                 self._L_eigs = torch.tensor(self._L_eigs.real).to(parse.device)
-                self._L_eigs = F.layer_norm(self._L_eigs, normalized_shape=(args.eigs_dim,))
+
+                # self._L_eigs = F.layer_norm(self._L_eigs, normalized_shape=(self._L_eigs.shape[-1],))
+
         return self._L_eigs
+
+    @property
+    def L_eigs_h(self):
+
+        if self._L_eigs_high is None:
+            if args.eigs_dim == 0:
+                self._L_eigs_high = torch.tensor([]).to(parse.device)
+            else:
+                _, self._L_eigs_high = sp.linalg.eigs(
+                    sp.csr_matrix(
+                        (self.L._values().cpu(), self.L._indices().cpu()),
+                        (self.num_nodes, self.num_nodes)
+                    ),
+                    k = args.eigs_dim,
+                    which='LR'
+                )
+                self._L_eigs_high = torch.tensor(self._L_eigs_high.real).to(parse.device)
+
+                # self._L_eigs_high = F.layer_norm(self._L_eigs_high, normalized_shape=(self._L_eigs_high.shape[-1],))
+
+        return self._L_eigs_high
+
+    @property
+    def motif_adj(self):
+        if self._motif_adj is not None:
+            return self._motif_adj
+
+        # 캐시 파일 경로 설정 (예: cache 폴더 내에 저장)
+        cache_file = os.path.join(f"cache/{args.data}", f"motif_adj_kmeansknn_{args.data}_k{args.n_neighbors}_nClust{args.num_motifs}.pkl")
+        if os.path.exists(cache_file):
+            print(f"Loading cached motif_adj from {cache_file}")
+            with open(cache_file, "rb") as f:
+                cache_data = pickle.load(f)
+            indices = torch.tensor(cache_data["indices"], dtype=torch.long, device=self.device)
+            values = torch.tensor(cache_data["values"], device=self.device)
+            size = cache_data["size"]
+            self._motif_adj = torch.sparse_coo_tensor(indices, values, size=size)
+            self._motif_ids = torch.tensor(cache_data["motif_ids"], dtype=torch.long, device=self.device)
+            return self._motif_adj
+
+        # 1. 노드 임베딩 준비 (Laplacian의 높은 고유벡터 사용)
+        eigs = self.L_eigs_h
+        node_emb = eigs.cpu().numpy()
+
+        # 2. KMeans 클러스터링으로 노드들을 그룹(모티프)으로 분할
+        kmeans = KMeans(n_clusters=args.num_motifs, random_state=args.seed)
+        labels = kmeans.fit_predict(node_emb)
+        # 각 노드의 클러스터(모티프) ID를 저장
+        self._motif_ids = torch.tensor(labels, dtype=torch.long, device=self.device)
+
+        # 3. 각 클러스터 내부에서 k‑NN으로 연결 구축
+        rows, cols = [], []
+        # 클러스터별로 반복
+        for cluster in range(args.num_motifs):
+            # 해당 클러스터에 속한 노드 인덱스 추출 (numpy array)
+            cluster_indices = np.where(labels == cluster)[0]
+            if cluster_indices.size > 1:
+                # 클러스터 내부의 임베딩 추출
+                cluster_emb = node_emb[cluster_indices]
+                # 클러스터의 크기에 따라 n_neighbors 설정 (자기 자신 포함하여 최소값)
+                n_neighbors = min(args.n_neighbors, cluster_indices.size)
+                knn_model = NearestNeighbors(n_neighbors=n_neighbors)
+                knn_model.fit(cluster_emb)
+                distances, knn_indices = knn_model.kneighbors(cluster_emb)
+                # 자기 자신은 첫 번째 컬럼에 있으므로 제거
+                knn_indices = knn_indices[:, 1:]
+                # 각 노드에 대해 k‑NN 이웃 정보를 엣지 리스트에 추가
+                for i in range(cluster_indices.size):
+                    current_node = cluster_indices[i]
+                    for neighbor_local_idx in knn_indices[i]:
+                        neighbor_global_idx = cluster_indices[neighbor_local_idx]
+                        rows.append(current_node)
+                        cols.append(neighbor_global_idx)
+            # 만약 클러스터에 단 한 개의 노드밖에 없다면 연결을 만들지 않습니다.
+        
+        # 4. 그래프의 대칭성을 위해, (i, j)와 (j, i)를 모두 추가
+        rows_sym = list(cols)
+        cols_sym = list(rows)
+        rows.extend(rows_sym)
+        cols.extend(cols_sym)
+
+        # 5. 리스트를 tensor로 변환 및 값 설정
+        rows = torch.tensor(rows, dtype=torch.long, device=self.device)
+        cols = torch.tensor(cols, dtype=torch.long, device=self.device)
+        vals = torch.ones(rows.size(0), device=self.device)
+
+        # 6. sparse COO tensor 생성
+        self._motif_adj = torch.sparse_coo_tensor(
+            torch.stack([rows, cols], dim=0),
+            vals,
+            size=(self.num_nodes, self.num_nodes)
+        )
+
+        # 7. 결과 캐시 파일에 저장
+        os.makedirs(f"cache/{args.data}", exist_ok=True)
+        with open(cache_file, "wb") as f:
+            cache_data = {
+                "indices": self._motif_adj._indices().cpu().numpy(),
+                "values": self._motif_adj._values().cpu().numpy(),
+                "size": self._motif_adj.size(),
+                "motif_ids": self._motif_ids.cpu().numpy()
+            }
+            pickle.dump(cache_data, f)
+            print(f"Saved motif_adj to cache file: {cache_file}")
+
+        return self._motif_adj
+
+    @property
+    def motif_ids(self):
+        if self._motif_ids is None:
+            _ = self.motif_adj
+        return self._motif_ids
 
     def sample(self):
         if self._indices is None:
@@ -268,8 +397,11 @@ class MyDataset(Dataset):
             next_indices = self._counts_sum[X[1]]-(torch.rand(X.shape[1]).to(parse.device)*self._counts[X[1]]).long()-1
             X = torch.stack([X[0], self._indices[1, next_indices]], dim=0)
             Y = Y*2+self._paths[next_indices]
-        return res_X, res_Y
-
+    
+        # motif_ids는 미리 motif_adj property에서 계산해둔 self._motif_ids 사용
+        motif_ids = self._motif_ids if self._motif_ids is not None else torch.zeros(self.num_nodes, dtype=torch.long, device=self.device)
+        
+        return res_X, motif_ids
 
 dataset = MyDataset(parse.train_file, parse.valid_file,
                     parse.test_file, parse.device)
