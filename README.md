@@ -1,7 +1,8 @@
 # MoSSformer : Motif-Enhanced Spectral Structures for Graph-Based Recommendation
 
 <!-- This is the PyTorch implementation for our SIGIR 2024 paper.  -->
-> Sichan OH, Jaekwang KIM, MoSSformer : Motif-Enhanced Spectral Structures for Graph-Based Recommendation
+<!-- > Sichan OH, Jaekwang KIM,  -->
+MoSSformer : Motif-Enhanced Spectral Structures for Graph-Based Recommendation
  <!-- [arXiv link](https://arxiv.org/abs/2404.11982) -->
 
 ## Environment
